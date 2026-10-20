@@ -1,0 +1,44 @@
+# ---- 本仓库不收录任何游戏资源 / 转储 / 二进制 ----
+*.so
+*.dll
+*.apk
+*.aab
+*.dat
+*.bundle
+*.unity3d
+*.assets
+dump*/
+dumpout*/
+pcdump/
+il2cpp.h
+dump.cs
+script.json
+stringliteral.json
+DummyDll/
+
+# ---- 地址表（自己填，不进版本库）----
+native/addresses.h
+
+# ---- 构建产物 ----
+native/*.o
+native/*.bin
+native/libmodkit.so
+out/
+
+# ---- 签名材料 ----
+*.jks
+*.keystore
+*.p12
+
+# ---- 调试输出 ----
+*.log
+*.png
+*.jpg
+
+# ---- Python / 编辑器 ----
+__pycache__/
+*.pyc
+.venv/
+.vs/
+.vscode/
+*.user
