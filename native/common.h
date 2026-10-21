@@ -2,8 +2,9 @@
  * ModKitTweaks · 手机端公共定义
  * =============================
  * 1) 日志 / 已解析地址 / 运行时开关（面板改的就是这些）
- * 2) 全部 RVA 与结构体字段偏移（绑定国际版 0.0.0，换版本必须重新标定）
+ * 2) 结构体字段偏移（绑定一份具体 dump，换版本/换游戏必须重新标定）
  * 3) il2cpp C API 指针（来自 libil2cpp.so 的导出符号，不写死偏移）
+ * 4) 函数地址表在 addresses.h —— 由 addresses.example.h 复制后自行填写
  */
 #pragma once
 
@@ -13,6 +14,7 @@
 
 /* ------------------------------------------------------------------ 版本锚点 */
 #define GAME_VERSION "0.0.0"
+#define MOD_VER "dev"   /* 本库自己的版本号，只用来对日志 */
 #define PKG_NAME "com.example.target"
 #define LOG_PATH "/sdcard/Android/data/" PKG_NAME "/files/modkit.log"
 /* 易物「已拿走」台账（避免同一件池子物件被反复复制） */
@@ -36,7 +38,8 @@ extern volatile int F_CAB;          /* 马车地图解锁 */
 extern volatile int F_STORY;        /* 剧情/队伍条件放宽 */
 extern volatile int F_WATER;        /* 水面可走（进水池 + 触发入水状态） */
 
-/* 函数地址表：从 addresses.example.h 复制成 addresses.h 后自行填写 */
+/* ================================================================= 地址表 */
+/* 不要在这里写死 RVA：全部集中到 addresses.h（gitignored），换客户端只改那一份 */
 #include "addresses.h"
 
 /* ================================================================= 偏移 */
@@ -49,6 +52,11 @@ extern volatile int F_WATER;        /* 水面可走（进水池 + 触发入水�
 #define OFF_KWV_VALUES 0x18      /* KeyWithValues.values (List<int>) */
 #define OFF_UI_NPC_BAG 0xA8      /* TradingWithNpcUI.npcBackPack */
 #define OFF_UI_NPC_TRADE 0xB8    /* TradingWithNpcUI.npcTrading */
+#define OFF_HOLD_TIMES 0x70      /* HoldNode.checkSucessTimes（addTimes 置 1 / clearTimes 置 0） */
+#define OFF_NODE_GRAPH 0x18      /* XNode.Node.graph -> NodeGraph（ScriptableObject，name 即剧情图 ID） */
+#define OFF_PARTNER_ID 0x58      /* ConditionNode(IsJoinedTeam/HavePartner).partnerID */
+#define OFF_PARTNER_NEGATE 0x5C  /* 同上 Negate（取反） */
+#define OFF_TEAM_STATE 0x130     /* GameCharacterInstance.m_TeamMemberState（== NULL 表示从未入队） */
 
 /* ================================================================= il2cpp API */
 typedef void* (*fn_i2c_get)(void);
@@ -61,7 +69,11 @@ typedef void* (*fn_i2c_new)(void*);
 typedef void* (*fn_i2c_str)(const char*);
 typedef void* (*fn_i2c_arr)(void*, size_t);
 typedef void (*fn_i2c_clsinit)(void*);
+typedef void* (*fn_i2c_objcls)(void*);        /* il2cpp_object_get_class -> Il2CppClass* */
+typedef const char* (*fn_i2c_clsname)(void*); /* il2cpp_class_get_name -> const char* */
 
+extern fn_i2c_objcls A_obj_get_class;
+extern fn_i2c_clsname A_class_get_name;
 extern fn_i2c_get A_domain_get;
 extern fn_i2c_asm A_get_assemblies;
 extern fn_i2c_img A_get_image;

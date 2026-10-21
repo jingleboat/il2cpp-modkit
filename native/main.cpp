@@ -1,27 +1,23 @@
 /*
- * ModKitTweaks · Android 原生插件（v4：易物三件套 + 游戏内面板）
+ * ModKitTweaks · Android 原生插件（主入口）
  * ==============================================================
- * 通道：il2cpp_init 首指令被静态改成 B 到插页里的引导桩，桩 dlopen 本库。
+ * 通道：il2cpp_init 首指令被改成 B 到插页里的引导桩，桩 dlopen 本库（注入方式自选）。
  * 本文件负责：
  *   1) 等 libil2cpp.so / il2cpp 运行时就绪，解析出全部 RVA 与 il2cpp C API
  *   2) 装 hook：
  *        易物三件套（trade.cpp）
  *        大地图 / 马车地图（IsMapEnable / IsPassIcon / HashSet.Contains / initIcon / cabIcon）
- *        剧情条件放宽（两个 CheckAllConnectNode）
+ *        剧情「需要伙伴」条件放宽（两个 CheckAllConnectNode 子类 → 走基类 + 按图名的规则）
+ *        水面可走（water.cpp）
  *        游戏内面板（ui.cpp，每帧 tick 挂在 MainThreadSynchronizationContext.Update）
- *   3) 全部功能都由运行时开关控制，面板点一下即时生效（默认全开）
- *
- * 静态补丁已全部取消（除了「鸣谢 → 模组页」那条 4 字节补丁，在 libil2cpp_intl_ui.so 里），
- * 因为静态补丁写死不可关，而面板要求每个开关都能实时切换。
+ *   3) 全部功能都由运行时开关控制，面板点一下即时生效
  */
 #include "common.h"
 #include "hook.h"
 #include "trade.h"
 #include "ui.h"
-/* probe / water 两个模块不进本仓库：
- *   probe.cpp 是调试用的状态导出，绑定了特定版本的结构布局；
- *   water.cpp 依赖 water_mask.h（按地图烘焙出来的可走格掩码，属于游戏数据）。
- * 需要时按同样的方式自己实现，然后在 install_tweaks() 里挂上。 */
+#include "probe.h"
+#include "water.h"
 
 #include <dlfcn.h>
 #include <link.h>
@@ -34,13 +30,13 @@
 #include <time.h>
 
 /* 游戏内面板开关：1 = 带面板（默认展开、可折叠），0 = 只装功能不建 UI */
-#define MK_PANEL 1
+#define WULIN_PANEL 1
 
 /* 排查探针：1 = 往 modkit.log 打水面/阻挡诊断，正式包改回 0 */
-#define MK_PROBE 0
+#define WULIN_PROBE 0
 
 /* DynamicModifier 运行时懒加载兜底：实测不可用（见 install_tweaks 注释） */
-#define MK_DM_LAZY 0
+#define WULIN_DM_LAZY 0
 
 /* ------------------------------------------------------------------ 全局 */
 uintptr_t g_base = 0;
@@ -51,7 +47,7 @@ volatile int F_TRADE_POOLS = 1;
 volatile int F_TRADE_TAKEALL = 1;
 volatile int F_MAP = 1;
 volatile int F_CAB = 1;
-volatile int F_STORY = 0;
+volatile int F_STORY = 1;   /* v44 起默认开（此前是 0，每次启动要手动点） */
 volatile int F_WATER = 1;
 
 fn_i2c_get A_domain_get = nullptr;
@@ -64,6 +60,8 @@ fn_i2c_new A_object_new = nullptr;
 fn_i2c_str A_string_new = nullptr;
 fn_i2c_arr A_array_new = nullptr;
 fn_i2c_clsinit A_class_init = nullptr;
+fn_i2c_objcls A_obj_get_class = nullptr;
+fn_i2c_clsname A_class_get_name = nullptr;
 
 /* ------------------------------------------------------------------ 日志 */
 void glog(const char* fmt, ...) {
@@ -194,7 +192,62 @@ static void resolve_save() {
     g_set_deny = *(void**)((char*)data + 0xD8);
 }
 
+/* ---- 存档集合的「尽早解析」 ------------------------------------------------
+ * 大地图 / 马车地图的解锁，全靠 hook_contains 认出这四个 HashSet 指针
+ * （enable / visible / allow / deny）后强行返回 1/0。
+ * 但 resolve_save() 原来只有两个调用点，都在马车地图的路径上
+ * （hook_cabIcon ← UICabMapManager.UpdateIconShow、inject_mapdata）。
+ *
+ * 后果：新开档 / 没打开过马车地图时，四个指针一直是 NULL，
+ * hook_contains 认不出任何集合 → 大地图照样锁定；
+ * 只有等玩家打开一遍马车地图，resolve_save 跑过之后才「突然生效」。
+ * 这就是「开放大地图需要打开一遍马车地图才生效」的成因。
+ *
+ * 修法：把 resolve_save() 提到所有用到它的入口，谁先来谁解析
+ * （大地图打开 → initIcon；IsMapEnable / IsPassIcon；马车 UpdateIconShow）。
+ * 解析本身很轻（读一个元数据槽 + 几次解引用），但为了不给热路径添开销，
+ * 未就绪时最多每 200ms 试一次；就绪后只做一次指针比较。
+ *
+ * 注意：**不在 hook_contains 里解析**。那是共享泛型 HashSet<T>.Contains，
+ * 存档/资源加载期间可能被后台线程调用，从工作线程碰 il2cpp（MonoSingleton.get_Instance、
+ * 解引用 Unity 对象）会直接崩。上面几个入口都是主线程的 UI 方法，安全。 */
+static uint64_t rule_now_ms(void);          /* 定义在剧情缓存那一节 */
+
+static int save_sets_ready(void) {
+    return ((uintptr_t)g_set_enable > 0x10000) || ((uintptr_t)g_set_vis > 0x10000);
+}
+
+static uint64_t g_save_try_t = 0;
+static int g_save_busy = 0;
+static void* g_last_enable = nullptr;
+
+/* force=1：忽略节流、无条件重新解析（大地图 initIcon / 马车 UpdateIconShow 这种低频入口用；
+ *          换档后集合指针会变，靠它们刷新）。
+ * force=0：只在未就绪时每 200ms 试一次，就绪后立刻返回（IsMapEnable/IsPassIcon 用）。 */
+static int ensure_save(int force) {
+    int ready = save_sets_ready();
+    if (ready && !force) return 1;
+    if (g_save_busy) return ready;
+
+    uint64_t now = rule_now_ms();
+    if (!force && g_save_try_t && now - g_save_try_t < 200) return ready;
+    g_save_try_t = now;
+
+    g_save_busy = 1;
+    resolve_save();
+    g_save_busy = 0;
+
+    ready = save_sets_ready();
+    if (ready && g_set_enable != g_last_enable) {
+        LOGI("地图: 存档集合%s enable=%p vis=%p allow=%p deny=%p",
+             g_last_enable ? "换档" : "已就绪", g_set_enable, g_set_vis, g_set_allow, g_set_deny);
+        g_last_enable = g_set_enable;
+    }
+    return ready;
+}
+
 static int hook_contains(void* set, int id, void* type) {
+    /* 这里只做集合比对，不解析存档（见上面注释：可能是后台线程） */
     if (set && F_MAP) {
         if (set == g_set_enable || set == g_set_vis) {
             if (g_map_log < 6) {
@@ -214,6 +267,7 @@ static int hook_contains(void* set, int id, void* type) {
 /* UIWorldMapManager.IsMapEnable(int) */
 static bool (*orig_is_map_enable)(void* self, int id) = nullptr;
 static bool hook_is_map_enable(void* self, int id) {
+    if (!save_sets_ready()) ensure_save(0);
     bool r = orig_is_map_enable ? orig_is_map_enable(self, id) : false;
     return F_MAP ? true : r;
 }
@@ -221,16 +275,30 @@ static bool hook_is_map_enable(void* self, int id) {
 /* UICabMapManager.IsPassIcon(int) */
 static bool (*orig_is_pass_icon)(void* self, int id) = nullptr;
 static bool hook_is_pass_icon(void* self, int id) {
+    if (!save_sets_ready()) ensure_save(0);
     bool r = orig_is_pass_icon ? orig_is_pass_icon(self, id) : false;
     return F_CAB ? true : r;
 }
 
 static void (*orig_initIcon)(void* self) = nullptr;
 static void hook_initIcon(void* self) {
-    if (orig_initIcon) orig_initIcon(self);
     if (self && !g_uimap) {
         g_uimap = self;
         LOGI("大地图: uimap=%p listWorldMap=%p", g_uimap, *(void**)((char*)self + 0xE0));
+    }
+    /* 先解析存档集合，再让游戏建图标 —— 这样第一遍建出来的图标就是解锁态，
+     * 不用等玩家去开一次马车地图。 */
+    int ready = ensure_save(1);
+    if (orig_initIcon) orig_initIcon(self);
+    /* 建图标时集合还没解析出来（存档刚载入等情形）：图标已按原版锁定态建好，
+     * 而集合刚刚就绪，重建一遍（等价于 inject_mapdata 末尾那次 orig_initIcon）。 */
+    if (!ready && orig_initIcon && ensure_save(1)) {
+        static int rebuilt = 0;
+        if (!rebuilt) {
+            rebuilt = 1;
+            orig_initIcon(self);
+            LOGI("大地图: 集合晚于图标初始化，已重建图标列表");
+        }
     }
 }
 
@@ -280,7 +348,7 @@ static void inject_mapdata(void* self) {
 
 static void (*orig_cabIcon)(void* self) = nullptr;
 static void hook_cabIcon(void* self) {
-    resolve_save();
+    ensure_save(1);
     if (orig_cabIcon) orig_cabIcon(self);
     if (F_CAB) inject_mapdata(self);
 }
@@ -290,45 +358,276 @@ static bool (*orig_check_joined)(void* self, int io, void* line) = nullptr;
 static bool (*orig_check_partner)(void* self, int io, void* line) = nullptr;
 typedef bool (*fn_check)(void*, int, void*);
 
-/* 「剧情条件放宽」的自旋闸门 -------------------------------------------------
- * 直接让 IsJoinedTeam / HavePartner 恒真会把剧情 Hold 节点变成"条件随时满足"，
- * StoryManager.ContinueArrange <-> HoldNode.OnActive 互相递归，切场景时栈溢出闪退
- * （实测 crash 栈：#n 反复出现 HoldNode.OnActive / HoldNode.Continue / ContinueArrange）。
- * 这里按「同一条件对象每秒最多放行 20 次」限流：正常剧情判定照旧放行，
- * 一旦出现空转就退回原逻辑，让 Hold 节点正常等待。 */
-#define GATE_SLOTS 16
-typedef struct { void* p; long long t; int n; } StoryGate;
-static StoryGate g_gate[GATE_SLOTS];
+/* 只跳过子类的「队友判断」，其余条件照查 --------------------------------
+ *
+ * 两个子类的 CheckAllConnectNode 反汇编出来是这么个结构：
+ *     if (CheckAllConnectNodeAction == null) return ...;
+ *     if (!CheckAllConnectNodeAction(self, io, line)) return false;   ← 队友在队判断
+ *     return base.CheckAllConnectNode(io, line);                      ← 尾调用基类
+ * 基类 ConditionNode.CheckAllConnectNode 做的事是：把 self 压进 line → CheckAllExceptSelf(io, line) → 弹出 self。
+ * 所以「跳过子类、直接跑基类」= 只丢掉 CheckAllConnectNodeAction 这一条，
+ * 连线上其它条件节点照常检查 —— 与桌面端 BepInEx 版的 jump-to-base 完全同义。
+ *
+ * 历史：v5 曾改成「hook 恒 return true」+ 每秒 20 次自旋闸门。恒真会让剧情 Hold 节点
+ * 变成"条件随时满足"，StoryManager.ContinueArrange 与 HoldNode.OnActive 互相递归，
+ * 切场景栈溢出闪退，那才是闸门存在的理由。走基类不改变 line 的语义、不会恒真，
+ * 这个副作用不存在，闸门一并去掉。 */
+static fn_check base_check_all = nullptr;
 
-static long long now_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+/* 下面两个函数定义在后面，这里先声明 */
+static const char* obj_name(void* o, char* buf, int cap);
+static int story_blacklisted(const char* g);
+
+/* 主线和师父的故事线：固定按原版判断（不放宽） */
+static const char* k_fixed_original[] = {
+    "Fame-2",
+    "Guide10099-6",  "Guide10099-11", "Guide10099-13",
+    "Guide10099-15", "Guide10099-16", "Guide10099-18",
+};
+
+/* R10005-11 -> 10005；不是 "R数字-" 形式返回 -1 */
+static int parse_r_id(const char* gn) {
+    if (!gn || gn[0] != 'R') return -1;
+    int v = 0, i = 1;
+    while (gn[i] >= '0' && gn[i] <= '9' && i < 12) { v = v * 10 + (gn[i] - '0'); ++i; }
+    if (i < 3) return -1;            /* 至少两位数字 */
+    if (gn[i] != '-') return -1;     /* 必须是 R<id>- */
+    return v;
 }
 
-static int story_pass_once(void* self) {
-    long long t = now_ms();
-    for (int i = 0; i < GATE_SLOTS; ++i) {
-        if (g_gate[i].p == self) {
-            if (t - g_gate[i].t > 1000) { g_gate[i].t = t; g_gate[i].n = 1; return 1; }
-            g_gate[i].n++;
-            return g_gate[i].n <= 20;
+/* 该角色是否从未入队：GameCharacterInstance.m_TeamMemberState(+0x130) == NULL。
+ * 实测：苗彩蝶/曼陀罗/癞头癫 = NULL；猎户/铁匠/玩家 = 非 NULL（入过队）。
+ * 拿不到实例时返回 0（当作已入队，保守地放宽）。 */
+static void* g_char_mgr = nullptr;
+static void* char_mgr() {
+    if ((uintptr_t)g_char_mgr > 0x10000) return g_char_mgr;
+    /* GameCharacterManager 在 WuLin 命名空间下（dump 确认），namespace 传空会找不到 */
+    void* k = find_class("WuLin", "GameCharacterManager");
+    if (!k) return nullptr;
+    void* inst = find_object_of_type(k);
+    if ((uintptr_t)inst > 0x10000) g_char_mgr = inst;
+    return g_char_mgr;
+}
+
+/* 判定缓存：条件节点 -> (是否按原版, 时间戳)，TTL 3 秒。
+ * 入队状态会变，不能永久缓存；但条件检查是热路径，每次读图名+调 GetCharacter 会卡。 */
+#define RULE_TTL_MS 3000
+#define RULE_CACHE_N 256
+static struct { void* node; int keep; uint64_t t; } g_rule_cache[RULE_CACHE_N];
+static int g_rule_cache_i = 0;
+
+static uint64_t rule_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+static int never_joined(int uid) {
+    if (uid <= 0) return 0;
+    void* m = char_mgr();
+    if ((uintptr_t)m < 0x10000) return 0;
+    typedef void* (*fn_getchar)(void*, int);
+    void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
+    if ((uintptr_t)c < 0x10000) return 0;
+    void* tms = *(void**)((char*)c + OFF_TEAM_STATE);
+    return ((uintptr_t)tms < 0x10000) ? 1 : 0;
+}
+
+/* 这个「角色在队」条件节点是否要**按原版判断**（不放宽）。
+ *
+ * 规则（与 PC 端一致）：
+ *   1) R{角色id}-xxx 这类角色剧情图：只有当条件里的 partnerID == 图名里的角色 id 时才走原版
+ *      —— 该角色入队后才开启自己的故事线；条件是别的角色时照常放宽（用来触发其它彩蛋）。
+ *   2) Fame-2 / Guide10099-6,11,13,15,16,18（主线与师父线）固定走原版。
+ *   3) 手动名单 story_blacklisted() 仍然生效。
+ *   4) 其余一律放宽。
+ * 读不到图名时保守返回 0（放宽），避免误挡。 */
+static int keep_original_for_uncached(void* condNode);
+
+/* 带 TTL 缓存的入口：条件检查是热路径，若每次读图名 + 调 GetCharacter 会卡。
+ * 入队状态会变，所以 TTL 3 秒，不能永久缓存。 */
+static int keep_original_for(void* condNode) {
+    if ((uintptr_t)condNode < 0x10000) return 0;
+
+    uint64_t now = rule_now_ms();
+    for (int i = 0; i < RULE_CACHE_N; ++i) {
+        if (g_rule_cache[i].node == condNode) {
+            if (now - g_rule_cache[i].t < (uint64_t)RULE_TTL_MS) return g_rule_cache[i].keep;
+            break;
         }
     }
-    for (int i = 0; i < GATE_SLOTS; ++i) {
-        if (!g_gate[i].p) { g_gate[i].p = self; g_gate[i].t = t; g_gate[i].n = 1; return 1; }
-    }
-    return 1;
+
+    int result = keep_original_for_uncached(condNode);
+
+    g_rule_cache[g_rule_cache_i].node = condNode;
+    g_rule_cache[g_rule_cache_i].keep = result;
+    g_rule_cache[g_rule_cache_i].t = now;
+    g_rule_cache_i = (g_rule_cache_i + 1) % RULE_CACHE_N;
+    return result;
+}
+
+static int keep_original_for_uncached(void* condNode) {
+    void* g = *(void**)((char*)condNode + OFF_NODE_GRAPH);
+    if ((uintptr_t)g < 0x10000) return 0;
+
+    char gb[128];
+    const char* gn = obj_name(g, gb, sizeof(gb));
+    if (!gn || !gn[0] || gn[0] == '?') return 0;
+
+    for (size_t i = 0; i < sizeof(k_fixed_original) / sizeof(k_fixed_original[0]); ++i)
+        if (strcmp(gn, k_fixed_original[i]) == 0) return 1;
+
+    if (story_blacklisted(gn)) return 1;
+
+    int selfId = parse_r_id(gn);
+    if (selfId <= 0) return 0;                       /* 非角色剧情图：放宽 */
+
+    int pid = *(int*)((char*)condNode + OFF_PARTNER_ID);
+    if (pid != selfId) return 0;                     /* 条件是别的角色：放宽（彩蛋） */
+    return never_joined(pid);                        /* 本命角色：仅「从未入队」时才挡 */
 }
 
 static bool hook_check_joined(void* self, int io, void* line) {
-    if (F_STORY && story_pass_once(self)) return true;
+    if (F_STORY && base_check_all && !keep_original_for(self))
+        return base_check_all(self, io, line);
     return orig_check_joined ? orig_check_joined(self, io, line) : false;
 }
 
 static bool hook_check_partner(void* self, int io, void* line) {
-    if (F_STORY && story_pass_once(self)) return true;
+    if (F_STORY && base_check_all && !keep_original_for(self))
+        return base_check_all(self, io, line);
     return orig_check_partner ? orig_check_partner(self, io, line) : false;
+}
+
+/* ---- ContinueArrange 递归看门狗 ------------------------------------------
+ * 放宽「队友在队 / 有伙伴」之后，某些剧情图里的 Hold 节点会立刻满足：
+ *   StoryManager.ContinueArrange <-> HoldNode.OnActive 在同一帧里互相递归，
+ * 几千层后原生栈溢出，进程直接消失（PC 端实测：Windows 事件日志
+ * Application Error id=1000，错误模块 GameAssembly.dll，异常代码 0xc00000fd）。
+ *
+ * 早先那两个 hook 里的「同一对象每秒 20 次」闸门不够用 —— 它按 self 分槽，
+ * 递归时若每层命中的是不同条件实例，各自都能放行 20 次，总深度照样爆栈。
+ * 这里改在递归的必经点 ContinueArrange 上按「真实调用栈深度」限深：
+ * 超过 16 层就跳过这一层推进。深度用 __thread，下一帧从 0 开始，
+ * 剧情继续往下走，不会把进度永久堵死。
+ * ContinueArrange 栈帧 0xd0 字节，16 层约 3.3 KB，离 8 MB 的线程栈很远。 */
+#define CA_MAX_DEPTH 16
+static void (*orig_continue_arrange)(void* self, void* node, void* port) = nullptr;
+static __thread int g_ca_depth = 0;
+static int g_ca_warn = 0;
+
+static const char* node_class_name(void* node) {
+    if ((uintptr_t)node < 0x10000 || !A_obj_get_class || !A_class_get_name) return "?";
+    void* k = A_obj_get_class(node);
+    if ((uintptr_t)k < 0x10000) return "?";
+    const char* n = A_class_get_name(k);
+    return n ? n : "?";
+}
+
+static void hook_continue_arrange(void* self, void* node, void* port) {
+    if (!F_STORY || !orig_continue_arrange) {
+        if (orig_continue_arrange) orig_continue_arrange(self, node, port);
+        return;
+    }
+    if (g_ca_depth >= CA_MAX_DEPTH) {
+        if (g_ca_warn < 5) {
+            g_ca_warn++;
+            LOGI("剧情: ContinueArrange 已递归 %d 层，阻断这一层（条件放宽引起 Hold 空转）节点=%s",
+                 g_ca_depth, node_class_name(node));
+        }
+        return;
+    }
+    g_ca_depth++;
+    orig_continue_arrange(self, node, port);
+    g_ca_depth--;
+}
+
+/* ---- Hold 只放行一次（治「剧情反复触发」） ------------------------------
+ * HoldNode.checkSucessTimes(+0x70) 是游戏自己的「这个 Hold 已经成功过」标志：
+ * addTimes() 置 1、clearTimes() 置 0。但 HoldNode.CheckCondition() 根本不读它 ——
+ * 反汇编确认它只做条件端口 GetConnections → 逐个 CheckAllConnectNode。
+ * 原版靠「条件为假」实现一次性；我们把条件放宽（走基类）之后，
+ * times 早已被置 1，结果却照样 true，剧情于是反复触发。
+ *
+ * PC 端实测（2026-10-20 BepInEx 日志）：
+ *   Hold "流程判断" times=0 result=true      ← 第一次，该放行
+ *   Hold "流程判断" times=1 result=true      ← 已经成功过，还在放行 ← 就是这里
+ *   Hold "流程判断" times=1 result=false     ← 原版本来就会挡住的
+ * 且 frameHits 恒为 1，说明不是同帧空转（那条路径由上面的 ContinueArrange 看门狗管）。
+ *
+ * 对策：times 非 0 的 Hold，若这次仍被判为「可继续」，就压回 false。
+ * 每个 Hold 只可能因为放宽而通过一次；游戏若用 clearTimes() 归零，之后还能再过一次，
+ * 语义与原版一致。 */
+static bool (*orig_hold_check)(void* self) = nullptr;
+static int g_hold_once_warn = 0;
+
+static const char* obj_name(void* o, char* buf, int cap) {
+    buf[0] = 0;
+    if ((uintptr_t)o < 0x10000) return "?";
+    typedef void* (*fn_getname)(void*);
+    void* s = ((fn_getname)(g_base + RVA_GET_NAME))(o);
+    if ((uintptr_t)s < 0x10000) return "?";
+    return str_to_buf(s, buf, cap);
+}
+
+/* 非拦截名单：名单内的剧情图，不做放宽、也不做 times 压制 —— 完全按原版判断。
+ * 名单外：正常放宽（只放宽「角色在队」这一条），并对 times 非 0 的 Hold 做压制兜底。
+ *
+ * 留空 = 全部按「放宽 + 兜底压制」跑。
+ * 已知候选（PC 端全量对比得出，存档里确实因为「角色在队」才通过的图）：
+ *   R10049-0 / R10112-2 / R10136-5 / R20004-4 / Role3-1 / R10036-3 / R10060-2-1..6
+ * 条目末尾带 * 时按前缀匹配（例如 "R10060-2-*"）。 */
+static const char* k_story_blacklist[] = {
+    "",
+};
+static const int k_story_blacklist_n =
+    (int)(sizeof(k_story_blacklist) / sizeof(k_story_blacklist[0]));
+
+static int story_blacklisted(const char* g) {
+    if (!g || !g[0] || g[0] == '?') return 0;
+    for (int i = 0; i < k_story_blacklist_n; ++i) {
+        const char* e = k_story_blacklist[i];
+        size_t L = strlen(e);
+        if (L == 0) continue;
+        if (e[L - 1] == '*') {
+            if (strncmp(g, e, L - 1) == 0) return 1;
+        } else if (strcmp(g, e) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static bool hook_hold_check(void* self) {
+    bool r = orig_hold_check ? orig_hold_check(self) : false;
+    if (!F_STORY || !r) return r;
+    if ((uintptr_t)self < 0x10000) return r;
+
+    int times = *(int*)((char*)self + OFF_HOLD_TIMES);
+    if (times == 0) return true;          /* 还没成功过：这次正常放行 */
+
+    /* 哪些图不做 times 压制（交给原版条件判断）：
+     *   - R{角色id}- 这类角色剧情图：入口条件已由 keep_original_for 精确控制，
+     *     这里再压制会让「角色入队后」也只剩一次，违背原版语义；
+     *   - 主线/师父线固定名单，同样按原版；
+     *   - 手动名单。 */
+    char gb[128];
+    void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
+    const char* gn = ((uintptr_t)g > 0x10000) ? obj_name(g, gb, sizeof(gb)) : "?";
+    if (parse_r_id(gn) > 0) return true;
+    for (size_t i = 0; i < sizeof(k_fixed_original) / sizeof(k_fixed_original[0]); ++i)
+        if (strcmp(gn, k_fixed_original[i]) == 0) return true;
+    if (story_blacklisted(gn)) return true;
+
+    /* 其余（非角色剧情图）：times 非 0 说明这个 Hold 已经成功过，再放行就是重复触发。
+     * 这是兜底 —— 名单只能覆盖已知事件，未知的循环事件靠这里压住。 */
+    if (g_hold_once_warn < 8) {
+        g_hold_once_warn++;
+        char nb[128];
+        LOGI("[once] 剧情图 %s 的 Hold \"%s\" times=%d 已通过过，压制本次（防重复触发）",
+             gn, obj_name(self, nb, sizeof(nb)), times);
+    }
+    return false;
 }
 
 /* ---- AssetBundle CRC 放行 ----
@@ -364,7 +663,7 @@ static void* hook_load_file_async(void* path, unsigned int crc, unsigned long lo
 
 /* ---- DynamicModifier 懒加载 ----
  * mod 里的 DynamicModifier asset 没被提前注册进 cachedDynamicModifierDict 时，游戏会报
- *   "获取DynamicModifier失败：Item/SomeDynamicModifier"
+ *   "获取DynamicModifier失败：Item/ShiQuanDaBuWan"
  * 这里在查找失败后，自己按 "DynamicModifier/<key>.asset" 从 mod 的 Addressables 补加载。 */
 static void* (*orig_get_modifier)(void* key) = nullptr;
 static void* (*load_asset_from_mod)(void* type, void* key) = nullptr;
@@ -453,6 +752,8 @@ static void install_tweaks() {
         A_string_new = (fn_i2c_str)dlsym(g_i2cpp, "il2cpp_string_new");
         A_array_new = (fn_i2c_arr)dlsym(g_i2cpp, "il2cpp_array_new");
         A_class_init = (fn_i2c_clsinit)dlsym(g_i2cpp, "il2cpp_runtime_class_init");
+        A_obj_get_class = (fn_i2c_objcls)dlsym(g_i2cpp, "il2cpp_object_get_class");
+        A_class_get_name = (fn_i2c_clsname)dlsym(g_i2cpp, "il2cpp_class_get_name");
         LOGI("il2cpp api: dom=%p asm=%p img=%p cls=%p ty=%p tyobj=%p new=%p str=%p",
              (void*)A_domain_get, (void*)A_get_assemblies, (void*)A_get_image,
              (void*)A_class_from_name, (void*)A_class_get_type, (void*)A_type_get_object,
@@ -472,8 +773,8 @@ static void install_tweaks() {
     /* ---- DynamicModifier 懒加载（patch 里的动态修改器没注册时兜底） ----
      * 实测这条路走不通：运行时 LoadAssetFromMod 取不到，返回 null 后
      * DynamicModifierInstance.get_IsValid 抛 NullReferenceException，
-     * 导致「某个物品」连用都用不了。默认关闭。 */
-#if MK_DM_LAZY
+     * 导致「十全大补丸」连用都用不了。默认关闭。 */
+#if WULIN_DM_LAZY
     load_asset_from_mod = (void* (*)(void*, void*))(g_base + RVA_MOD_LOAD_ASSET_FROM_MOD);
     hook_install("DynamicModifier.GetModifier", (void*)(g_base + RVA_DM_GET_MODIFIER),
                  (void*)hook_get_modifier, (void**)&orig_get_modifier);
@@ -487,7 +788,7 @@ static void install_tweaks() {
                  (void*)hook_steal_init, (void**)&orig_steal_init);
 
     /* ---- 水面可走 ---- */
-    /* water_install();  // 见上方说明：依赖自备的地图掩码数据 */
+    water_install();
 
     /* ---- 大地图 / 马车 ---- */
     hook_install("地图.Contains", (void*)(g_base + RVA_HASHSET_CONTAINS),
@@ -501,18 +802,30 @@ static void install_tweaks() {
     hook_install("马车.UpdateIconShow", (void*)(g_base + RVA_CAB_UPDATE_ICON),
                  (void*)hook_cabIcon, (void**)&orig_cabIcon);
 
-    /* ---- 剧情条件 ---- */
+    /* ---- 剧情条件 ----
+     * 两个子类 hook 都把「队友在队」判断换成基类实现，不再整函数恒真。 */
+    base_check_all = (fn_check)(g_base + RVA_STORY_BASE);
+    LOGI("剧情条件: 基类 CheckAllConnectNode @ %p", (void*)base_check_all);
     hook_install("剧情.IsJoinedTeam", (void*)(g_base + RVA_STORY_JOINED),
                  (void*)hook_check_joined, (void**)&orig_check_joined);
     hook_install("剧情.HavePartner", (void*)(g_base + RVA_STORY_PARTNER),
                  (void*)hook_check_partner, (void**)&orig_check_partner);
 
-#if MK_PROBE
-    /* probe_install(); */
+    /* ContinueArrange 递归看门狗：条件放宽后 Hold 空转会在这一层栈溢出 */
+    hook_install("剧情.ContinueArrange", (void*)(g_base + RVA_STORY_CONTINUE),
+                 (void*)hook_continue_arrange, (void**)&orig_continue_arrange);
+
+    /* 兜底：名单外的剧情图，times 非 0 就不再放行（防未知的循环事件）。
+     * 名单内的图在这里直接放行，交给原版判断。 */
+    hook_install("剧情.HoldCheck", (void*)(g_base + RVA_HOLD_CHECK),
+                 (void*)hook_hold_check, (void**)&orig_hold_check);
+
+#if WULIN_PROBE
+    probe_install();
 #endif
 
     /* ---- 面板（最后装：它自己会建 UI） ---- */
-#if MK_PANEL
+#if WULIN_PANEL
     ui_install();
 #else
     LOGI("面板已关闭（本版只测功能，全部默认开启）");
@@ -572,7 +885,8 @@ static void* worker(void*) {
 __attribute__((constructor))
 static void modkit_on_load() {
     unlink(LOG_PATH);
-    LOGI("=========== libmodkit.so v4 已加载 (pid %d, %s) ===========", getpid(), GAME_VERSION);
+    LOGI("=========== libmodkit.so %s 已加载 (pid %d, 游戏 %s) ===========", MOD_VER, getpid(),
+         GAME_VERSION);
     pthread_t t;
     if (pthread_create(&t, nullptr, worker, nullptr) != 0) {
         LOGE("pthread_create 失败");

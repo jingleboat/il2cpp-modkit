@@ -19,7 +19,7 @@ try {
     }
     Write-Host '--- libmodkit.so'
     & $cc -shared -fPIC -O2 -Wall -Wextra -o libmodkit.so `
-        main.cpp trade.cpp ui.cpp hook.cpp -llog -lm `
+        main.cpp trade.cpp ui.cpp hook.cpp water.cpp -llog -lm `
         '-Wl,-soname,libmodkit.so' '-Wl,--build-id=none'
     if ($LASTEXITCODE) { throw 'clang failed' }
 

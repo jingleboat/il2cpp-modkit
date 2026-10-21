@@ -76,7 +76,14 @@
 /* ---- 剧情条件 ---- */
 #define RVA_STORY_JOINED 0x0       /* IsJoinedTeamCondition.CheckAllConnectNode */
 #define RVA_STORY_PARTNER 0x0      /* HavePartnerCondition.CheckAllConnectNode */
-#define RVA_STORY_BASE 0x0         /* ConditionNode.CheckAllConnectNode（基类实现） */
+#define RVA_STORY_BASE 0x0         /* ConditionNode.CheckAllConnectNode（基类实现）—— 走它才只丢掉子类那一条判断 */
+#define RVA_STORY_CONTINUE 0x0     /* StoryManager.ContinueArrange(Node,string) —— 递归看门狗挂这里 */
+#define RVA_GET_CHARACTER 0x0      /* GameCharacterManager.GetCharacter(int) —— 从 uid 拿实例 */
+#define RVA_HOLD_CHECK 0x0         /* HoldNode.CheckCondition() —— 「Hold 只放行一次」挂这里 */
+
+/* ---- 水面可走 ---- */
+#define RVA_MM_ISBLOCK 0x0         /* bool MapManager.IsBlock(Vector3Int) */
+#define RVA_MM_ISSWIM 0x0          /* bool MapManager.IsSwimGrid(Vector3Int) */
 
 /* ---- Addressables / AssetBundle ---- */
 #define RVA_ABRO_GET_CRC 0x0       /* AssetBundleRequestOptions.get_Crc() */
