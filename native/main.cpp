@@ -560,13 +560,20 @@ static int keep_original_for_uncached(void* condNode) {
     return never_joined(pid);                        /* 本命角色：仅「从未入队」时才挡 */
 }
 
+/* 每次「需要伙伴 / 有伙伴」条件判定 +1（按线程）。
+ * HoldNode.CheckCondition 用它判断「这次判定到底有没有碰队友条件」：
+ * 没碰就说明这个 Hold 与放宽无关，不该被压制 —— 否则会打断游戏设计的可重复剧情。 */
+static __thread int g_team_cond_hits = 0;
+
 static bool hook_check_joined(void* self, int io, void* line) {
+    g_team_cond_hits++;
     if (F_STORY && base_check_all && !keep_original_for(self))
         return base_check_all(self, io, line);
     return orig_check_joined ? orig_check_joined(self, io, line) : false;
 }
 
 static bool hook_check_partner(void* self, int io, void* line) {
+    g_team_cond_hits++;
     if (F_STORY && base_check_all && !keep_original_for(self))
         return base_check_all(self, io, line);
     return orig_check_partner ? orig_check_partner(self, io, line) : false;
@@ -672,17 +679,21 @@ static int story_blacklisted(const char* g) {
 }
 
 static bool hook_hold_check(void* self) {
+    /* 判据不再看"图名像不像角色剧情"，而是看**这次判定到底有没有碰队友条件**：
+     *   - 没碰（计数没变）→ 这个 Hold 与放宽无关，一行都不碰；
+     *   - 碰过 + times!=0 + 这次仍然通过 → 是放宽把"一次性"变成了"可重复"→ 压回 false。 */
+    int before = g_team_cond_hits;
     bool r = orig_hold_check ? orig_hold_check(self) : false;
     if (!F_STORY || !r) return r;
+    if (g_team_cond_hits == before) return r;      /* 本次判定没碰队友条件：不干预 */
     if ((uintptr_t)self < 0x10000) return r;
 
     int times = *(int*)((char*)self + OFF_HOLD_TIMES);
     if (times == 0) return true;          /* 还没成功过：这次正常放行 */
 
-    /* 哪些图不做 times 压制（交给原版条件判断）：
-     *   - R{角色id}- 这类角色剧情图：入口条件已由 keep_original_for 精确控制，
-     *     这里再压制会让「角色入队后」也只剩一次，违背原版语义；
-     *   - 主线/师父线固定名单，同样按原版；
+    /* 三条例外（交给原版语义，不做压制）：
+     *   - R{角色id}- 图：条件已由 keep_original_for 精确判定，再压制会让「入队后」也只剩一次；
+     *   - 固定名单（主线/师父线/点名压制的图），同样按原版；
      *   - 手动名单。 */
     char gb[128];
     void* g = *(void**)((char*)self + OFF_NODE_GRAPH);
@@ -692,12 +703,11 @@ static bool hook_hold_check(void* self) {
         if (strcmp(gn, k_fixed_original[i]) == 0) return true;
     if (story_blacklisted(gn)) return true;
 
-    /* 其余（非角色剧情图）：times 非 0 说明这个 Hold 已经成功过，再放行就是重复触发。
-     * 这是兜底 —— 名单只能覆盖已知事件，未知的循环事件靠这里压住。 */
+    /* 其余：队友条件被放宽后，这个 Hold 已经通过过还要再过 → 压回 false。 */
     if (g_hold_once_warn < 8) {
         g_hold_once_warn++;
         char nb[128];
-        LOGI("[once] 剧情图 %s 的 Hold \"%s\" times=%d 已通过过，压制本次（防重复触发）",
+        LOGI("[once] 剧情图 %s 的 Hold \"%s\" times=%d 已通过过，压制本次（放宽引起的重复触发）",
              gn, obj_name(self, nb, sizeof(nb)), times);
     }
     return false;
