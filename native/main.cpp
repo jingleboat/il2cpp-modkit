@@ -212,6 +212,7 @@ static void resolve_save() {
  * 存档/资源加载期间可能被后台线程调用，从工作线程碰 il2cpp（MonoSingleton.get_Instance、
  * 解引用 Unity 对象）会直接崩。上面几个入口都是主线程的 UI 方法，安全。 */
 static uint64_t rule_now_ms(void);          /* 定义在剧情缓存那一节 */
+static void char_mgr_reset(void);           /* 定义在「从未入队」那一节：换档后清角色管理器缓存 */
 
 static int save_sets_ready(void) {
     return ((uintptr_t)g_set_enable > 0x10000) || ((uintptr_t)g_set_vis > 0x10000);
@@ -242,6 +243,7 @@ static int ensure_save(int force) {
         LOGI("地图: 存档集合%s enable=%p vis=%p allow=%p deny=%p",
              g_last_enable ? "换档" : "已就绪", g_set_enable, g_set_vis, g_set_allow, g_set_deny);
         g_last_enable = g_set_enable;
+        char_mgr_reset();       /* 换档后 GameCharacterManager 可能换实例，别用旧指针 */
     }
     return ready;
 }
@@ -381,6 +383,7 @@ static int story_blacklisted(const char* g);
 /* 主线和师父的故事线：固定按原版判断（不放宽） */
 static const char* k_fixed_original[] = {
     "Fame-2",
+    "Guide10099-1",                  /* 2026-10-21 追加：与 6/11/13… 同属师父线 */
     "Guide10099-6",  "Guide10099-11", "Guide10099-13",
     "Guide10099-15", "Guide10099-16", "Guide10099-18",
 };
@@ -396,16 +399,24 @@ static int parse_r_id(const char* gn) {
 }
 
 /* 该角色是否从未入队：GameCharacterInstance.m_TeamMemberState(+0x130) == NULL。
- * 实测：苗彩蝶/曼陀罗/癞头癫 = NULL；猎户/铁匠/玩家 = 非 NULL（入过队）。
- * 拿不到实例时返回 0（当作已入队，保守地放宽）。 */
+ * 实测（老档）：苗彩蝶/曼陀罗/癞头癫 = NULL；猎户/铁匠/玩家 = 非 NULL（入过队）。
+ *
+ * 管理器实例缓存 60 秒。换档/重载后 GameCharacterManager 可能换实例，
+ * 旧指针悬空会读到垃圾甚至崩，所以定期重找；换档时由 ensure_save() 主动清。 */
 static void* g_char_mgr = nullptr;
+static uint64_t g_char_mgr_t = 0;
+#define CHAR_MGR_TTL_MS 60000
+
+static void char_mgr_reset(void) { g_char_mgr = nullptr; g_char_mgr_t = 0; }
+
 static void* char_mgr() {
-    if ((uintptr_t)g_char_mgr > 0x10000) return g_char_mgr;
+    uint64_t now = rule_now_ms();
+    if ((uintptr_t)g_char_mgr > 0x10000 && now - g_char_mgr_t < CHAR_MGR_TTL_MS) return g_char_mgr;
     /* GameCharacterManager 在 WuLin 命名空间下（dump 确认），namespace 传空会找不到 */
     void* k = find_class("WuLin", "GameCharacterManager");
-    if (!k) return nullptr;
-    void* inst = find_object_of_type(k);
-    if ((uintptr_t)inst > 0x10000) g_char_mgr = inst;
+    void* inst = k ? find_object_of_type(k) : nullptr;
+    g_char_mgr = ((uintptr_t)inst > 0x10000) ? inst : nullptr;
+    g_char_mgr_t = now;
     return g_char_mgr;
 }
 
@@ -422,15 +433,31 @@ static uint64_t rule_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+/* 2026-10-21 修正：拿不到实例 / 管理器未就绪时，旧实现返回 0（当作已入队 → 放宽）。
+ * 新档里游戏还没创建大部分角色实例，判据于是集体失效 → 本命角色的个人剧情被放宽，
+ * 不该触发的剧情提前触发（PC 端日志同源：`[nj] uid=10006 实例未创建`）。
+ * 语义上「连实例都没有」必然没入过队，所以兜底只能是 1（不放宽，走原版）。
+ * ⚠️ 这与 MapKit/CharKit 那类「查不到就放行」的兜底方向相反 —— 这里的放行等于放宽剧情。 */
+static int g_nj_log = 0;
+
 static int never_joined(int uid) {
     if (uid <= 0) return 0;
+
     void* m = char_mgr();
-    if ((uintptr_t)m < 0x10000) return 0;
+    if ((uintptr_t)m < 0x10000) {
+        if (g_nj_log++ < 40) LOGI("[nj] uid=%d 管理器未就绪 → 按「从未入队」（不放宽）", uid);
+        return 1;
+    }
     typedef void* (*fn_getchar)(void*, int);
     void* c = ((fn_getchar)(g_base + RVA_GET_CHARACTER))(m, uid);
-    if ((uintptr_t)c < 0x10000) return 0;
+    if ((uintptr_t)c < 0x10000) {
+        if (g_nj_log++ < 40) LOGI("[nj] uid=%d 实例未创建 → 从未入队（不放宽）", uid);
+        return 1;
+    }
     void* tms = *(void**)((char*)c + OFF_TEAM_STATE);
-    return ((uintptr_t)tms < 0x10000) ? 1 : 0;
+    int v = ((uintptr_t)tms < 0x10000) ? 1 : 0;
+    if (g_nj_log++ < 40) LOGI("[nj] uid=%d ptr=%p tms=%p → neverJoined=%d", uid, c, tms, v);
+    return v;
 }
 
 /* 这个「角色在队」条件节点是否要**按原版判断**（不放宽）。
