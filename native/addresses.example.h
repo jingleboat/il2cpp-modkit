@@ -85,6 +85,10 @@
 #define RVA_MM_ISBLOCK 0x0         /* bool MapManager.IsBlock(Vector3Int) */
 #define RVA_MM_ISSWIM 0x0          /* bool MapManager.IsSwimGrid(Vector3Int) */
 
+/* ---- 剧情里的「图标显示」类条件（判定期间抑制地图解锁，见 main.cpp 注释） ---- */
+#define RVA_CITY_VISIBLE_CHECK 0x0 /* WorldMapCityVisibleCondition.CheckAllConnectNode（判断大地图图标显示） */
+#define RVA_CAB_PASS_COND 0x0      /* CabPassIconCondition.CheckAllConnectNode（判断马车图标是否通过） */
+
 /* ---- Addressables / AssetBundle ---- */
 #define RVA_ABRO_GET_CRC 0x0       /* AssetBundleRequestOptions.get_Crc() */
 #define RVA_AB_LOAD_FROM_FILE_ASYNC 0x0 /* AssetBundle.LoadFromFileAsync_Internal(string,uint,ulong) */

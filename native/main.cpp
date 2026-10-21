@@ -248,8 +248,31 @@ static int ensure_save(int force) {
     return ready;
 }
 
+/* ---- 剧情条件期间临时关掉地图解锁 -----------------------------------------
+ * 「判断大地图图标显示」这个条件节点内部走的是
+ *     UIWorldMapManager.IsCityVisible(mapID)
+ *         → [uimap+0xD8]+0x20 的管理器 +0xA0（= 我们的 g_set_vis）→ HashSet<int>.Contains
+ * （反汇编 IsCityVisible 确认：尾部就是 b 到 Contains）。
+ * 所以手机端在 Contains 上做的全局解锁会把「图标没显示」判成「显示了」
+ * → 这类剧情门槛恒真 → 剧情提前可获知
+ * （实例：R10112-2「烈酒与故事」的入口就是 判断大地图图标显示(5064)）。
+ *
+ * 解法：在这两个条件节点被判定期间把解锁拦截临时关掉（g_map_suppress>0），
+ * 让它读原版数据；UI 那侧不受影响，地图照样全开。
+ * 效果等价于 PC 端「只在 UI 层 patch、不碰数据」的做法。 */
+static volatile int g_map_suppress = 0;
+static int g_suppress_log = 0;
+
 static int hook_contains(void* set, int id, void* type) {
     /* 这里只做集合比对，不解析存档（见上面注释：可能是后台线程） */
+    if (g_map_suppress > 0) {
+        /* 剧情里的「图标显示」类条件：一律读原版数据（enable/visible/allow/deny 都不拦） */
+        if (set == g_set_vis && g_suppress_log < 24) {
+            g_suppress_log++;
+            LOGI("[cond] 剧情条件期间走原版：visible.Contains(%d) 不强制为 1", id);
+        }
+        return orig_contains ? orig_contains(set, id, type) : 0;
+    }
     if (set && F_MAP) {
         if (set == g_set_enable || set == g_set_vis) {
             if (g_map_log < 6) {
@@ -264,6 +287,25 @@ static int hook_contains(void* set, int id, void* type) {
         if (set == g_set_deny) return 0;
     }
     return orig_contains ? orig_contains(set, id, type) : 0;
+}
+
+/* 「判断大地图图标显示」/「判断马车图标是否通过」：判定期间抑制地图解锁 */
+static bool (*orig_city_visible_cc)(void* self, int io, void* line) = nullptr;
+static bool hook_city_visible_cc(void* self, int io, void* line) {
+    if (!orig_city_visible_cc) return true;
+    g_map_suppress++;
+    bool r = orig_city_visible_cc(self, io, line);
+    g_map_suppress--;
+    return r;
+}
+
+static bool (*orig_cab_pass_cc)(void* self, int io, void* line) = nullptr;
+static bool hook_cab_pass_cc(void* self, int io, void* line) {
+    if (!orig_cab_pass_cc) return true;
+    g_map_suppress++;
+    bool r = orig_cab_pass_cc(self, io, line);
+    g_map_suppress--;
+    return r;
 }
 
 /* UIWorldMapManager.IsMapEnable(int) */
@@ -380,12 +422,16 @@ static fn_check base_check_all = nullptr;
 static const char* obj_name(void* o, char* buf, int cap);
 static int story_blacklisted(const char* g);
 
-/* 主线和师父的故事线：固定按原版判断（不放宽） */
+/* 主线和师父的故事线：固定按原版判断（不放宽）。
+ * 末尾两条是「用户点名要压住」的个别剧情（条件是别人角色，按彩蛋规则会放宽）。 */
 static const char* k_fixed_original[] = {
     "Fame-2",
     "Guide10099-1",                  /* 2026-10-21 追加：与 6/11/13… 同属师父线 */
     "Guide10099-6",  "Guide10099-11", "Guide10099-13",
     "Guide10099-15", "Guide10099-16", "Guide10099-18",
+    "R10112-2",                      /* 2026-10-21 追加：烈酒与故事。图里 8 条「需要伙伴」全是别人的
+                                      * 角色（10008/10009/10005/10015），按彩蛋规则会被放宽 → 剧情提前播出。
+                                      * 用户要求压回原版：那些角色不在队就不该演。 */
 };
 
 /* R10005-11 -> 10005；不是 "R数字-" 形式返回 -1 */
@@ -828,6 +874,18 @@ static void install_tweaks() {
                  (void*)hook_initIcon, (void**)&orig_initIcon);
     hook_install("马车.UpdateIconShow", (void*)(g_base + RVA_CAB_UPDATE_ICON),
                  (void*)hook_cabIcon, (void**)&orig_cabIcon);
+
+    /* ---- 剧情里的「图标显示」类条件：判定期间抑制地图解锁（v48） ----
+     * 不抑制的话，地图解锁会把「某图标没显示」判成「显示了」，
+     * 让这类剧情门槛恒真（R10112-2「烈酒与故事」就是这么被提前获知的）。 */
+    if (hook_install("剧情.大地图图标条件", (void*)(g_base + RVA_CITY_VISIBLE_CHECK),
+                     (void*)hook_city_visible_cc, (void**)&orig_city_visible_cc))
+        LOGI("剧情条件: 判断大地图图标显示 @ %p（判定期间走原版）",
+             (void*)(g_base + RVA_CITY_VISIBLE_CHECK));
+    if (hook_install("剧情.马车图标条件", (void*)(g_base + RVA_CAB_PASS_COND),
+                     (void*)hook_cab_pass_cc, (void**)&orig_cab_pass_cc))
+        LOGI("剧情条件: 判断马车图标是否通过 @ %p（判定期间走原版）",
+             (void*)(g_base + RVA_CAB_PASS_COND));
 
     /* ---- 剧情条件 ----
      * 两个子类 hook 都把「队友在队」判断换成基类实现，不再整函数恒真。 */
